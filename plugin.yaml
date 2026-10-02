@@ -1,0 +1,6 @@
+name: usage-monitor
+version: "1.0.0"
+description: "Hermes usage dashboard as Desktop plugin — model/token usage, rate-limit health, smart free-model combo builder"
+author: Hermes
+provides_tools:
+  - usage_health

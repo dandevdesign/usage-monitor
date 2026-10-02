@@ -1,0 +1,8 @@
+{
+  "name": "usage-monitor",
+  "label": "Usage",
+  "description": "Hermes model/token usage, rate-limit health and smart free-model combo.",
+  "icon": "Activity",
+  "version": "1.0.0",
+  "api": "plugin_api.py"
+}
