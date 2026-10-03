@@ -4,12 +4,14 @@
  * Only imports: @hermes/plugin-sdk, react, react/jsx-runtime.
  */
 import {
-  Badge, Button, EmptyState, ErrorState, haptic, host, KEYBINDS_AREA,
-  PALETTE_AREA, queryClient, ROUTES_AREA, SegmentedControl, SIDEBAR_NAV_AREA,
-  Skeleton, STATUSBAR_AREAS, Tip, usePluginI18n, useQuery,
+  Badge, Button, Checkbox, CopyButton, Dialog, DialogContent,
+  DialogDescription, DialogHeader, DialogTitle, EmptyState, ErrorState,
+  haptic, host, KEYBINDS_AREA, PALETTE_AREA, queryClient, ROUTES_AREA,
+  SearchField, SegmentedControl, SIDEBAR_NAV_AREA, Skeleton, STATUSBAR_AREAS,
+  Switch, Tip, usePluginI18n, useQuery,
 } from '@hermes/plugin-sdk'
 import { jsx, jsxs } from 'react/jsx-runtime'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 
 const ID = 'usage-monitor'
 const PATH = '/usage'
@@ -21,6 +23,7 @@ const WINDOWS = [
   { id: '168', label: '7d' },
 ]
 let pluginCtx = null // set in register(); closed over by everything below
+let lastLimitedKeys = null // chip: diff source for new-limited notify (#7)
 const rest = (path, opts) =>
   pluginCtx
     ? pluginCtx.rest(path, opts)
@@ -53,9 +56,9 @@ const useSummary = () => useQuery({
   queryFn: () => rest('/summary?hours=24'),
   refetchInterval: 30000,
 })
-const useCombo = (hours) => useQuery({
-  queryKey: [ID, 'combo', hours],
-  queryFn: () => rest('/combo?hours=' + hours),
+const useCombo = (hours, incl) => useQuery({
+  queryKey: [ID, 'combo', hours, incl ? 'u' : 'c'],
+  queryFn: () => rest('/combo?hours=' + hours + (incl ? '&include_unused=1' : '')),
   refetchInterval: 15000,
 })
 
@@ -119,6 +122,32 @@ const EN = {
   // errors
   errUsage: 'usage unavailable', errHealth: 'health unavailable',
   errCombo: 'combo unavailable',
+  // v1.1 — filters, report, raw errors, cadence, candidates, auto, velocity
+  filterSearch: 'Filter models…',
+  onlyFree: 'only free', onlyBroken: 'only problems',
+  showing: (a, b) => a + ' of ' + b + ' models',
+  copyReport: 'Copy report',
+  hLat: 'Lat/TTFT', hCtx: 'Ctx', hIQ: 'IQ', hTag: 'Tag', hTpm: 'tok/min',
+  rawErrors: 'Full error detail', rawNone: 'no raw upstream text',
+  dialogClose: 'Close',
+  secBreakers: 'Domain circuit breakers (OmniRoute)',
+  breakerOk: 'all CLOSED — no domain blocked',
+  hCountdown: 'Next reset',
+  secCandidates: 'Unused healthy free models — candidates for free-smart',
+  noCandidates: 'every healthy free model is already used somewhere',
+  candWillInclude: 'will be included',
+  includeUnused: 'Include unused healthy free models',
+  autoRefresh: 'Auto-refresh combo',
+  autoEvery: 'every',
+  auto1: '1h', auto3: '3h', auto6: '6h', auto12: '12h',
+  autoChanged: (n) => 'written — order changed (' + n + ' models)',
+  autoSame: 'order unchanged — no write',
+  autoFail: (e) => 'auto-refresh failed: ' + e,
+  secVelocity: 'Top token burners — last 5 min',
+  velocityEmpty: 'no tagged traffic in the last 5 min',
+  notifyLimited: 'Notify when a model goes limited',
+  notifyTitle: 'Model rate-limited',
+  notifyBody: (m, p) => m + ' @ ' + p + ' is rate-limited right now',
 }
 const BG = {
   title: 'Монитор на потреблението',
@@ -173,6 +202,31 @@ const BG = {
   cmdLabel: 'Отвори монитора на потреблението',
   errUsage: 'потреблението е недостъпно', errHealth: 'здравето е недостъпно',
   errCombo: 'комбото е недостъпно',
+  filterSearch: 'Филтър модели…',
+  onlyFree: 'само free', onlyBroken: 'само проблемни',
+  showing: (a, b) => a + ' от ' + b + ' модела',
+  copyReport: 'Копирай отчет',
+  hLat: 'Lat/TTFT', hCtx: 'Контекст', hIQ: 'IQ', hTag: 'Таг', hTpm: 'ток/мин',
+  rawErrors: 'Пълни детайли на грешките', rawNone: 'няма суров текст от upstream',
+  dialogClose: 'Затвори',
+  secBreakers: 'Domain circuit breakers (OmniRoute)',
+  breakerOk: 'всички затворени — нищо не е блокирано',
+  hCountdown: 'Следващ резет',
+  secCandidates: 'Неизползвани здрави free модели — кандидати за free-smart',
+  noCandidates: 'всички здрави free модели вече се ползват някъде',
+  candWillInclude: 'ще бъде включен',
+  includeUnused: 'Включи неизползвани здрави free модели',
+  autoRefresh: 'Авто-обновяване на комбото',
+  autoEvery: 'на всеки',
+  auto1: '1ч', auto3: '3ч', auto6: '6ч', auto12: '12ч',
+  autoChanged: (n) => 'записано — редът се промени (' + n + ' модела)',
+  autoSame: 'редът не е променен — без запис',
+  autoFail: (e) => 'авто-обновяването провали: ' + e,
+  secVelocity: 'Най-големи горивци на токени — последните 5 мин',
+  velocityEmpty: 'няма трафик с таг последните 5 мин',
+  notifyLimited: 'Нотификация при нов limited модел',
+  notifyTitle: 'Моделът е rate-limited',
+  notifyBody: (m, p) => m + ' @ ' + p + ' е ограничен точно сега',
 }
 
 // ── shared building blocks ───────────────────────────────────────────────
@@ -211,7 +265,7 @@ function Sec({ title, children }) {
   })
 }
 
-function Tbl({ cols, rows }) {
+function Tbl({ cols, rows, onRow }) {
   if (!rows || !rows.length) return jsx(EmptyState, { title: 'no data' })
   return jsx('div', {
     className: 'overflow-x-auto rounded-md border border-(--ui-stroke-secondary)',
@@ -227,7 +281,9 @@ function Tbl({ cols, rows }) {
         jsx('tbody', {
           children: rows.map((r, i) =>
             jsx('tr', {
-              className: 'border-t border-(--ui-stroke-secondary)',
+              className: 'border-t border-(--ui-stroke-secondary)'
+                + (onRow ? ' cursor-pointer' : ''),
+              onClick: onRow ? () => onRow(i) : undefined,
               children: r.map((v, j) =>
                 jsx('td', { className: 'px-2 py-1.5 whitespace-nowrap', children: v }, j)),
             }, i)),
@@ -273,7 +329,7 @@ function QuotaSec({ t, quota }) {
   if (!quota || !quota.length)
     return jsx('p', { className: 'text-xs text-(--ui-text-secondary)', children: t('quotaNoData') })
   return jsx(Tbl, {
-    cols: [t('hProvider'), t('hQuotaPct'), '', t('hReset'), t('hConn')],
+    cols: [t('hProvider'), t('hQuotaPct'), '', t('hReset'), t('hCountdown'), t('hConn')],
     rows: quota.map((q) => {
       const pct = q.remaining_pct == null ? null : Math.max(0, Math.round(q.remaining_pct))
       const danger = q.exhausted || (pct != null && pct < 25)
@@ -294,6 +350,10 @@ function QuotaSec({ t, quota }) {
           }),
         }),
         jsx('span', { className: 'font-mono', children: q.next_reset_at || '-' }),
+        jsx('span', { className: 'font-mono text-xs text-(--ui-text-secondary)',
+          children: (q.predicted || []).slice(0, 2).map((pr) =>
+            pr.window_key + ' ' + pr.next_est + ' (~' + pr.countdown_h + 'h)')
+              .join(' · ') || '-' }),
         jsx('span', { className: 'text-(--ui-text-secondary)', children: (q.connection_id || '').slice(0, 8) }),
       ]
     }),
@@ -323,50 +383,174 @@ function FallbackSec({ t, fb }) {
   })
 }
 
+function buildReport(t, d) {
+  const L = []
+  const sum = d.summary || {}
+  const tr = d.trend || {}
+  L.push('# usage-monitor report — window ' + d.window_hours + 'h')
+  L.push('limited=' + (sum.limited || 0) + ' failing=' + (sum.failing || 0)
+    + ' degraded=' + (sum.degraded || 0) + ' healthy=' + (sum.healthy || 0))
+  if (tr.errors_delta_pct != null) {
+    L.push('errors ' + tr.errors_now + ' vs prev ' + tr.errors_prev + ' ('
+      + tr.errors_delta_pct + '%)')
+  }
+  L.push('')
+  L.push('| status | model | provider | ok | err | err% | lat | ctx | reason |')
+  L.push('|---|---|---|--:|--:|--:|--:|--:|---|')
+  for (const m of (d.models || [])) {
+    L.push('| ' + [
+      t('st_' + m.status), m.model, m.provider, m.ok_calls, m.err_calls,
+      m.err_rate + '%',
+      m.avg_latency_ms != null ? (m.avg_latency_ms / 1000).toFixed(1) + 's' : '-',
+      m.ctx_real || '-',
+      String(m.last_why || '-').replace(/\|/g, '/').slice(0, 60),
+    ].join(' | ') + ' |')
+  }
+  return L.join('\n')
+}
+
 function HealthTab({ t, hours }) {
   const q = useHealth(hours)
   const sm = useSummary()
+  const [fq, setFq] = useState('')
+  const [onlyFree, setOnlyFree] = useState(false)
+  const [onlyBroken, setOnlyBroken] = useState(false)
+  const [raw, setRaw] = useState(null)
+  const [notify, setNotify] = useState(() =>
+    !!(pluginCtx && pluginCtx.storage.get('notifyLimited', false)))
   if (q.isLoading) return jsx(Skeleton, { className: 'w-full', style: { height: '160px' } })
   if (q.isError) return jsx(ErrorState, { title: t('errHealth'),
     description: String((q.error && q.error.message) || q.error) })
   const d = q.data || { summary: {}, models: [] }
-  const s = d.summary || {}
+  const sum = d.summary || {}
   const tl = d.err_timeline || {}
+  const all = d.models || []
+  const needle = fq.trim().toLowerCase()
+  const filtered = all.filter((m) => {
+    if (onlyFree && !m.free) return false
+    if (onlyBroken && m.status === 'healthy') return false
+    if (needle && (m.model + ' ' + m.provider).toLowerCase().indexOf(needle) < 0)
+      return false
+    return true
+  })
+  const report = buildReport(t, d)
+  const setNotifyVal = (v) => {
+    const b = v === true
+    setNotify(b)
+    if (pluginCtx) pluginCtx.storage.set('notifyLimited', b)
+  }
+  const cols = [t('hStatus'), t('hModel'), t('hProvider'), t('hOk'),
+    t('hErr'), t('hErrPct'), t('hLat'), t('hCtx')]
+  if (d.has_intel) cols.push(t('hIQ'))
+  cols.push(t('sparkNote'), t('hLastProblem'))
+  const rows = filtered.map((m) => {
+    const row = [
+      jsx(Badge, { variant: stColor(m.status), children: t('st_' + m.status) }),
+      jsx('span', { className: 'font-mono', children: m.model }),
+      jsxs('span', { className: 'text-(--ui-text-secondary)', children: [
+        m.provider, m.quota_pct != null ? ' \u00b7 ' + Math.round(m.quota_pct) + '%' : '',
+      ] }),
+      String(m.ok_calls),
+      String(m.err_calls),
+      (m.err_rate || 0) + '%',
+      m.avg_latency_ms != null
+        ? (m.avg_latency_ms / 1000).toFixed(1) + '/'
+          + ((m.avg_ttft_ms || 0) / 1000).toFixed(1) + 's'
+        : '-',
+      m.ctx_real ? fmtN(m.ctx_real) : '-',
+    ]
+    if (d.has_intel) row.push(m.iq != null ? String(m.iq) : '-')
+    row.push(
+      jsx(Tip, { label: t('sparkNote'),
+        children: jsx(Spark, { arr: (tl.series || {})[m.model + '|' + m.provider] }) }),
+      jsx(Tip, {
+        label: (m.errors || []).map((e) => e.etype + ' ' + e.status + ' x' + e.n).join('; ') || '-',
+        children: jsx('span', { className: 'text-(--ui-text-secondary)',
+          children: (m.last_why || '-').slice(0, 80) }),
+      }))
+    return row
+  })
   return jsxs('div', {
     children: [
       jsxs('div', {
         className: 'flex flex-wrap items-center gap-2',
         children: ['limited', 'failing', 'degraded', 'healthy'].map((k) =>
-          jsx(Badge, { variant: stColor(k), children: t('st_' + k) + ': ' + (s[k] || 0) }, k)),
-      }),
+          jsx(Badge, { variant: stColor(k), children: t('st_' + k) + ': ' + (sum[k] || 0) }, k)),
+        jsx('span', { className: 'flex-1' }),
+        jsxs('label', { className: 'flex items-center gap-1.5 text-xs',
+          children: [jsx(Switch, { checked: notify, onCheckedChange: setNotifyVal }),
+            t('notifyLimited')] }),
+      ]),
       jsx('p', { className: 'text-xs text-(--ui-text-secondary)', children: t('healthIntro') }),
+      jsxs('div', {
+        className: 'flex flex-wrap items-center gap-3',
+        children: [
+          jsx(SearchField, { placeholder: t('filterSearch'), value: fq, onChange: setFq }),
+          jsxs('label', { className: 'flex items-center gap-1.5 text-xs',
+            children: [jsx(Checkbox, { checked: onlyFree,
+              onCheckedChange: (v) => setOnlyFree(v === true) }), t('onlyFree')] }),
+          jsxs('label', { className: 'flex items-center gap-1.5 text-xs',
+            children: [jsx(Checkbox, { checked: onlyBroken,
+              onCheckedChange: (v) => setOnlyBroken(v === true) }), t('onlyBroken')] }),
+          jsx('span', { className: 'text-(--ui-text-secondary)',
+            children: t('showing', filtered.length, all.length) }),
+          jsx(CopyButton, { text: report, label: t('copyReport'), showLabel: true }),
+        ],
+      }),
       jsx(Sec, { title: t('secTrend'), children: jsx(TrendChips, { t, trend: d.trend }) }),
+      jsx(Sec, {
+        title: t('secBreakers'),
+        children: (d.circuit_breakers || []).length
+          ? jsx(Tbl, {
+              cols: ['Domain', t('hStatus'), t('hEvents'), t('hLast')],
+              rows: d.circuit_breakers.map((b) => [
+                jsx('span', { className: 'font-mono', children: b.name }),
+                jsx(Badge, { variant: b.state === 'CLOSED' ? 'success' : 'destructive',
+                  children: b.state }),
+                String(b.failures), b.last_failure || '-',
+              ]),
+            })
+          : jsx('p', { className: 'text-xs text-(--ui-text-secondary)',
+              children: t('breakerOk') }),
+      }),
       jsx(Sec, { title: t('secQuota'), children: jsx(QuotaSec, { t, quota: d.quota }) }),
       sm.data && jsx(Sec, { title: t('secFallback'),
         children: jsx(FallbackSec, { t, fb: sm.data.fallback }) }),
-      jsx(Sec, {
-        title: t('secHealth'),
-        children: jsx(Tbl, {
-          cols: [t('hStatus'), t('hModel'), t('hProvider'), t('hOk'), t('hErr'),
-                 t('hErrPct'), t('sparkNote'), t('hLastProblem')],
-          rows: (d.models || []).map((m) => [
-            jsx(Badge, { variant: stColor(m.status), children: t('st_' + m.status) }),
-            jsx('span', { className: 'font-mono', children: m.model }),
-            jsxs('span', { className: 'text-(--ui-text-secondary)', children: [
-              m.provider, m.quota_pct != null ? ' · ' + Math.round(m.quota_pct) + '%' : '',
-            ] }),
-            String(m.ok_calls),
-            String(m.err_calls),
-            (m.err_rate || 0) + '%',
-            jsx(Tip, { label: t('sparkNote'),
-              children: jsx(Spark, { arr: (tl.series || {})[m.model + '|' + m.provider] }) }),
-            jsx(Tip, {
-              label: (m.errors || []).map((e) => e.etype + ' ' + e.status + ' x' + e.n).join('; ') || '-',
-              children: jsx('span', { className: 'text-(--ui-text-secondary)',
-                children: (m.last_why || '-').slice(0, 80) }),
-            }),
-          ]),
-        }),
+      jsx(Sec, { title: t('secHealth'),
+        children: jsx(Tbl, { cols, rows, onRow: (i) => setRaw(filtered[i]) }) }),
+      jsx(Dialog, {
+        open: !!raw,
+        onOpenChange: (o) => { if (!o) setRaw(null) },
+        children: raw ? jsxs(DialogContent, {
+          children: [
+            jsx(DialogHeader, { children: jsx(DialogTitle,
+              { children: raw.model + ' @ ' + raw.provider }) }),
+            jsx(DialogDescription,
+              { children: raw.last_why || t('st_' + raw.status) }),
+            jsx('div', { className: 'mt-2 max-h-72 overflow-y-auto',
+              children: (raw.errors || []).length
+                ? raw.errors.map((e, i) => jsxs('div', {
+                    className: 'mb-2 rounded-md border border-(--ui-stroke-secondary) p-2',
+                    children: [
+                      jsxs('div', { className: 'text-xs font-medium',
+                        children: [e.etype + ' \u00b7 HTTP ' + e.status + ' \u00d7' + e.n,
+                          jsx('span', { className: 'text-(--ui-text-secondary)',
+                            children: ' \u2014 ' + e.why })] }),
+                      jsx('pre', { className: 'mt-1 whitespace-pre-wrap break-all font-mono text-xs',
+                        children: e.raw || t('rawNone') }),
+                    ] }, i))
+                : jsx('p', { className: 'text-xs', children: t('rawNone') }) }),
+            jsxs('div', { className: 'mt-3 flex justify-end gap-2',
+              children: [
+                jsx(CopyButton, {
+                  text: (raw.errors || []).map((e) => e.etype + ' ' + e.status
+                    + ' x' + e.n + ': ' + e.why + '\n' + (e.raw || '')).join('\n\n')
+                    || raw.model,
+                  label: t('copyReport') }),
+                jsx(Button, { onClick: () => setRaw(null), children: t('dialogClose') }),
+              ] }),
+          ],
+        }) : null,
       }),
     ],
   })
@@ -375,16 +559,56 @@ function HealthTab({ t, hours }) {
 function ComboTab({ t, hours }) {
   const [msg, setMsg] = useState('')
   const [busy, setBusy] = useState(false)
-  const q = useCombo(hours)
+  const [incl, setIncl] = useState(() =>
+    !!(pluginCtx && pluginCtx.storage.get('includeUnused', false)))
+  const [auto, setAuto] = useState(() =>
+    !!(pluginCtx && pluginCtx.storage.get('autoRefresh', false)))
+  const [every, setEvery] = useState(() =>
+    String(pluginCtx ? pluginCtx.storage.get('autoEvery', '6') : '6'))
+  const [autoLog, setAutoLog] = useState('')
+  const q = useCombo(hours, incl)
   if (q.isLoading) return jsx(Skeleton, { className: 'w-full', style: { height: '160px' } })
   if (q.isError) return jsx(ErrorState, { title: t('errCombo'),
     description: String((q.error && q.error.message) || q.error) })
-  const d = q.data || { steps: [], pool_size: 0 }
+  const d = q.data || { steps: [], pool_size: 0, candidates: [] }
+  const setInclV = (v) => {
+    const b = v === true
+    setIncl(b)
+    if (pluginCtx) pluginCtx.storage.set('includeUnused', b)
+  }
+  const setAutoV = (v) => {
+    const b = v === true
+    setAuto(b)
+    if (pluginCtx) pluginCtx.storage.set('autoRefresh', b)
+  }
+  const setEveryV = (v) => {
+    setEvery(v)
+    if (pluginCtx) pluginCtx.storage.set('autoEvery', v)
+  }
+  const runAuto = async () => {
+    try {
+      const r = await rest('/combo/auto-refresh',
+        { method: 'POST', body: { hours: Number(hours), include_unused: incl } })
+      setAutoLog(r.changed ? t('autoChanged', r.steps) : t('autoSame'))
+    } catch (e) {
+      setAutoLog(t('autoFail', String((e && e.message) || e)))
+    }
+  }
+  // #6 opt-in timer: check now on enable, then every N hours; writes ONLY
+  // when the order actually changed (backend digest compare).
+  useEffect(() => {
+    if (!auto || !pluginCtx) return undefined
+    void runAuto()
+    const dispose = pluginCtx.setInterval(() => { void runAuto() },
+      Math.max(1, Number(every)) * 3600 * 1000)
+    return dispose
+  }, [auto, every, incl, hours])
   const write = async () => {
     setBusy(true)
     setMsg('')
     try {
-      const r = await rest('/combo/write', { method: 'POST', body: { hours: Number(hours) } })
+      const r = await rest('/combo/write',
+        { method: 'POST', body: { hours: Number(hours), include_unused: incl } })
       setMsg(t('writeOk', r.steps))
       host.notify({ kind: 'info', message: t('writeOk', r.steps) })
       queryClient.invalidateQueries({ queryKey: [ID, 'combo'] })
@@ -394,14 +618,56 @@ function ComboTab({ t, hours }) {
       setBusy(false)
     }
   }
+  const cands = d.candidates || []
   return jsxs('div', {
     children: [
-      jsx('p', { className: 'text-xs text-(--ui-text-secondary)', children: t('comboIntro', d.pool_size) }),
-      jsxs('div', { className: 'mt-2 flex items-center gap-2', children: [
-        jsx(Button, { disabled: busy || !pluginCtx, onClick: write,
-          children: busy ? t('writing') : t('writeBtn') }),
-      ] }),
-      msg ? jsx('p', { className: 'mt-2 text-xs text-(--ui-text-secondary)', children: msg }) : null,
+      jsx('p', { className: 'text-xs text-(--ui-text-secondary)',
+        children: t('comboIntro', d.pool_size) }),
+      jsxs('div', { className: 'mt-2 flex flex-wrap items-center gap-3',
+        children: [
+          jsx(Button, { disabled: busy || !pluginCtx, onClick: write,
+            children: busy ? t('writing') : t('writeBtn') }),
+          jsxs('label', { className: 'flex items-center gap-1.5 text-xs',
+            children: [jsx(Checkbox, { checked: incl,
+              onCheckedChange: setInclV }), t('includeUnused')] }),
+          jsxs('label', { className: 'flex items-center gap-1.5 text-xs',
+            children: [jsx(Switch, { checked: auto,
+              onCheckedChange: setAutoV }), t('autoRefresh')] }),
+          auto ? jsxs('span', { className: 'flex items-center gap-1.5 text-xs',
+            children: [t('autoEvery'),
+              jsx(SegmentedControl, { value: every, onChange: setEveryV,
+                options: [
+                  { id: '1', label: t('auto1') },
+                  { id: '3', label: t('auto3') },
+                  { id: '6', label: t('auto6') },
+                  { id: '12', label: t('auto12') },
+                ] })] }) : null,
+        ] }),
+      autoLog ? jsx('p', { className: 'mt-1 text-xs text-(--ui-text-secondary)',
+        children: autoLog }) : null,
+      msg ? jsx('p', { className: 'mt-2 text-xs text-(--ui-text-secondary)',
+        children: msg }) : null,
+      cands.length ? jsx(Sec, {
+        title: t('secCandidates') + ' (' + cands.length + ')',
+        children: jsx(Tbl, {
+          cols: [t('hModel'), t('hProvider'), t('hInput'), t('hCtx'),
+                 t('hLat'), ''],
+          rows: cands.map((c) => [
+            jsx('span', { className: 'font-mono', children: c.model }),
+            jsx('span', { className: 'text-(--ui-text-secondary)',
+              children: c.provider }),
+            fmtN(c.ok_tokens),
+            c.ctx_real ? fmtN(c.ctx_real) : '-',
+            c.avg_latency_ms != null
+              ? (c.avg_latency_ms / 1000).toFixed(1) + 's' : '-',
+            incl ? jsx(Badge, { variant: 'success',
+              children: t('candWillInclude') })
+                : jsx('span', { className: 'text-(--ui-text-secondary)',
+                    children: '-' }),
+          ]),
+        }),
+      }) : jsx('p', { className: 'text-xs text-(--ui-text-secondary)',
+        children: t('noCandidates') }),
       jsx(Sec, {
         title: t('secProposed'),
         children: jsx(Tbl, {
@@ -410,7 +676,9 @@ function ComboTab({ t, hours }) {
           rows: (d.steps || []).map((s) => [
             String(s.i),
             jsx(Badge, { variant: stColor(s.status), children: t('st_' + s.status) }),
-            jsx('span', { className: 'font-mono', children: s.model }),
+            jsxs('span', { className: 'font-mono', children: [s.model,
+              s.source === 'unused'
+                ? jsx(Badge, { variant: 'success', children: ' new' }) : null] }),
             jsx('span', { className: 'text-(--ui-text-secondary)', children: s.providerId }),
             String(s.ok_calls),
             (s.err_rate || 0) + '%',
@@ -447,6 +715,21 @@ function UsageTab({ t, hours }) {
             s2.last_seen,
           ]),
         }),
+      }),
+      jsx(Sec, {
+        title: t('secVelocity'),
+        children: (d.velocity || []).length
+          ? jsx(Tbl, {
+              cols: [t('hTag'), t('hModel'), t('hCalls'), t('hTpm')],
+              rows: d.velocity.map((v) => [
+                jsx('span', { className: 'font-mono',
+                  children: String(v.tag).replace(/^conv_/, '').slice(0, 12) }),
+                jsx('span', { className: 'font-mono', children: v.model }),
+                String(v.calls), fmtN(v.tpm),
+              ]),
+            })
+          : jsx('p', { className: 'text-xs text-(--ui-text-secondary)',
+              children: t('velocityEmpty') }),
       }),
       jsx(Sec, {
         title: t('secAnswered', d.window_hours),
@@ -537,6 +820,24 @@ function UsagePage() {
 function UsageChip() {
   const t = usePluginI18n(ID)
   const q = useSummary()
+  // #7: opt-in OS notification when a model joins the limited set
+  useEffect(() => {
+    if (!q.data) return
+    const keys = (q.data.limited_models || [])
+      .map((x) => x.model + '@' + x.provider)
+    const want = !!(pluginCtx
+      && pluginCtx.storage.get('notifyLimited', false))
+    if (want && lastLimitedKeys && pluginCtx && pluginCtx.os
+        && pluginCtx.os.notify) {
+      const fresh = keys.filter((k) => lastLimitedKeys.indexOf(k) < 0)
+      if (fresh.length) {
+        const at = fresh[0].split('@')
+        pluginCtx.os.notify({ title: t('notifyTitle'),
+          body: t('notifyBody', at[0], at[1]) })
+      }
+    }
+    lastLimitedKeys = keys
+  }, [q.data])
   const s = (q.data && q.data.summary) || null
   const pinned = (q.data && q.data.pinned) || []
   let text, cls

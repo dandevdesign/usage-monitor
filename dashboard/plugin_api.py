@@ -8,6 +8,7 @@ No external API calls, no cost.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -22,7 +23,7 @@ from fastapi.responses import JSONResponse
 import usage_core as core
 
 router = APIRouter()
-PLUGIN_VERSION = "1.0.0"
+PLUGIN_VERSION = "1.1.0"
 
 _HEALTH_TTL = 10.0
 _health_cache: dict = {}
@@ -202,6 +203,120 @@ def _maybe_broadcast(summary, pinned):
     except Exception:
         pass      # plugin-only process without a gateway: silent no-op
 
+
+def _iso(v):
+    try:
+        return datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+
+
+def _latency_map(o, hours):
+    """avg latency + ttft per model@provider from usage_history (window)."""
+    if not core.has_table(o, "usage_history"):
+        return {}
+    rows = o.execute("SELECT coalesce(model,'?') m, coalesce(provider,'?') p," +
+        " round(avg(latency_ms)) lat, round(avg(ttft_ms)) ttft" +
+        " FROM usage_history WHERE timestamp >= ? AND success = 1" +
+        " AND latency_ms IS NOT NULL GROUP BY m, p",
+        (core.since_iso(hours),)).fetchall()
+    return {(r["m"], r["p"]): {"lat": r["lat"], "ttft": r["ttft"]}
+            for r in rows}
+
+
+def _context_maps(o):
+    """context windows: (by provider+model_id, by normalized model id)."""
+    if not core.has_table(o, "model_context_overrides"):
+        return {}, {}
+    rows = o.execute("SELECT provider, model_id, real_context" +
+        " FROM model_context_overrides").fetchall()
+    by_prov, norm = {}, {}
+    for r in rows:
+        prov = str(r["provider"] or "")
+        mid = str(r["model_id"] or "").lower()
+        if not mid or not r["real_context"]:
+            continue
+        by_prov.setdefault(prov, {})[mid] = r["real_context"]
+        norm.setdefault(_norm_model(mid), r["real_context"])
+    return by_prov, norm
+
+
+def _lookup_ctx(maps, model, provider):
+    by_prov, norm = maps
+    pm = by_prov.get(str(provider), {})
+    v = pm.get(str(model or "").lower())
+    if v is None:
+        v = pm.get(_norm_model(model))
+    if v is None:
+        v = norm.get(_norm_model(model))
+    return v
+
+
+def _intel_map(o):
+    """best intelligence score per normalized model (0..1)."""
+    if not core.has_table(o, "model_intelligence"):
+        return {}
+    rows = o.execute("SELECT model, score FROM model_intelligence" +
+        " WHERE (expires_at IS NULL OR expires_at > datetime('now'))"
+        ).fetchall()
+    out = {}
+    for r in rows:
+        n = _norm_model(r["model"])
+        sc = float(r["score"] or 0)
+        if n not in out or sc > out[n]:
+            out[n] = sc
+    return out
+
+
+def _breakers(o):
+    """domain circuit breakers: full list + provider -> state map."""
+    if not core.has_table(o, "domain_circuit_breakers"):
+        return [], {}
+    rows = o.execute("SELECT name, state, failure_count," +
+        " last_failure_time FROM domain_circuit_breakers").fetchall()
+    lst = [{"name": r["name"], "state": r["state"],
+            "failures": r["failure_count"] or 0,
+            "last_failure": core._ago(r["last_failure_time"])
+                if r["last_failure_time"] else ""} for r in rows]
+    return lst, {str(r["name"]): str(r["state"]) for r in rows}
+
+
+def _reset_cadence(o):
+    """per provider+window: typical reset duration and next predicted reset."""
+    if not core.has_table(o, "provider_quota_reset_events"):
+        return {}
+    rows = o.execute("SELECT provider, window_key, window_started_at," +
+        " window_resets_at FROM provider_quota_reset_events" +
+        " ORDER BY id DESC LIMIT 200").fetchall()
+    groups = {}
+    for r in rows:
+        st, rs = _iso(r["window_started_at"]), _iso(r["window_resets_at"])
+        if st and rs:
+            groups.setdefault((str(r["provider"]), str(r["window_key"])),
+                              []).append((st, rs))
+    out = {}
+    now = datetime.now(timezone.utc)
+    for (prov, wk), pairs in groups.items():
+        durs = [(rs - st).total_seconds() / 3600.0 for st, rs in pairs
+                if rs > st]
+        if not durs:
+            continue
+        cad = sum(durs) / len(durs)
+        nxt = max(rs for st, rs in pairs)
+        guard = 0
+        while nxt <= now and guard < 400:
+            nxt = nxt + timedelta(hours=cad)
+            guard += 1
+        if nxt <= now:
+            continue
+        out.setdefault(prov, []).append({
+            "window_key": wk, "cadence_h": round(cad, 1),
+            "next_est": nxt.strftime("%Y-%m-%d %H:%M"),
+            "countdown_h": round((nxt - now).total_seconds() / 3600.0, 1)})
+    for v in out.values():
+        v.sort(key=lambda x: x["countdown_h"])
+    return out
+
 def model_health(hours=24.0):
     now = time.time()
     ck = round(hours, 2)
@@ -233,6 +348,11 @@ def model_health(hours=24.0):
         quotas = _quota_latest(o)
         trend = _trend(o, hours)
         timeline = _err_timeline(o)
+        lat = _latency_map(o, hours)
+        ctx_maps = _context_maps(o)
+        intel = _intel_map(o)
+        breaker_list, breaker_map = _breakers(o)
+        cadence = _reset_cadence(o)
     finally:
         try:
             o.close()
@@ -251,7 +371,8 @@ def model_health(hours=24.0):
         e["err_calls"] += r["n"] or 0
         why = core._why(r["etype"], r["esum"], r["status"])
         e["errors"].append({"etype": r["etype"] or "(no type)",
-            "status": r["status"], "n": r["n"], "why": why})
+            "status": r["status"], "n": r["n"], "why": why,
+            "raw": (r["esum"] or "")[:600]})
         if (r["last_err"] or "") > e["last_err_iso"]:
             e["last_err_iso"] = r["last_err"] or ""
             e["last_err"] = (r["last_err"] or "")[5:16]
@@ -271,6 +392,8 @@ def model_health(hours=24.0):
             "rate_limited": (rl_ts > now) or prev.get("rate_limited", False),
             "active": bool(c["is_active"]) and prev.get("active", True),
             "last_error": (c["last_error"] or prev.get("last_error", ""))[:200]}
+    for q in quotas:
+        q["predicted"] = cadence.get(q["provider"], [])[:3]
     quota_map = {q["provider"]: q for q in quotas}
     models = []
     for model, provider in set(ok_map) | set(err_map):
@@ -315,10 +438,19 @@ def model_health(hours=24.0):
             "last_status": er.get("last_status"),
             "last_why": er.get("last_why", "") or ps.get("last_error", ""),
             "quota_pct": (quota or {}).get("remaining_pct"),
+            "avg_latency_ms": (lat.get((model, provider)) or {}).get("lat"),
+            "avg_ttft_ms": (lat.get((model, provider)) or {}).get("ttft"),
+            "ctx_real": _lookup_ctx(ctx_maps, model, provider),
+            "iq": round(100 * intel[_norm_model(model)])
+                if _norm_model(model) in intel else None,
             "conn_rate_limited": ps.get("rate_limited", False),
             "conn_rate_limited_until": ps.get("rate_limited_until", ""),
             "conn_active": ps.get("active", True),
             "status": status})
+        st = breaker_map.get(str(provider))
+        if st and st != "CLOSED":
+            models[-1]["status"] = "failing"
+            models[-1]["last_why"] = "circuit breaker " + st
     models.sort(key=lambda m: ({"limited": 0, "failing": 1,
         "degraded": 2, "healthy": 3}[m["status"]], -m["err_calls"]))
     summary = {"limited": 0, "failing": 0, "degraded": 0, "healthy": 0}
@@ -327,11 +459,13 @@ def model_health(hours=24.0):
     payload = {"generated_at": datetime.now().isoformat(timespec="seconds"),
                "window_hours": hours, "summary": summary, "models": models,
                "throttled_providers": thro, "quota": quotas,
-               "trend": trend, "err_timeline": timeline}
+               "trend": trend, "err_timeline": timeline,
+               "circuit_breakers": breaker_list,
+               "has_intel": bool(intel)}
     _health_cache[ck] = (now, payload)
     return payload
 
-def smart_combo(hours=24.0):
+def smart_combo(hours=24.0, include_unused=False):
     health = model_health(hours)
     hmap = {(m["model"], m["provider"]): m for m in health["models"]}
     o = _omni()
@@ -368,6 +502,26 @@ def smart_combo(hours=24.0):
                 pool[base] = {"model": name, "providerId": pid,
                               "source": cb["name"], "_rank": cand_rank,
                               "_tok": cand_tok}
+    # unused healthy free models — candidates not yet in ANY combo (#5)
+    pool_bases = set(pool)
+    candidates = []
+    for m in health["models"]:
+        if m["status"] != "healthy":
+            continue
+        if not (m.get("free") or _is_free_entry(m["model"], m["provider"])):
+            continue
+        if m["base"] in pool_bases:
+            continue
+        candidates.append({"model": m["model"], "provider": m["provider"],
+            "ok_tokens": m.get("ok_tokens", 0),
+            "ctx_real": m.get("ctx_real"),
+            "avg_latency_ms": m.get("avg_latency_ms")})
+    candidates.sort(key=lambda c: -c["ok_tokens"])
+    if include_unused:
+        for c in candidates[:40]:
+            pool[_norm_model(c["model"])] = {
+                "model": c["model"], "providerId": c["provider"],
+                "source": "unused", "_rank": 0, "_tok": c["ok_tokens"]}
     ordered = sorted(pool.values(),
                      key=lambda e: (e["_rank"], -e["_tok"], e["model"]))
     steps = []
@@ -376,6 +530,7 @@ def smart_combo(hours=24.0):
         status = h.get("status", "healthy")
         steps.append({
             "i": i, "model": e["model"], "providerId": e["providerId"],
+            "source": e.get("source", "combo"),
             "status": status, "ok_calls": h.get("ok_calls", 0),
             "err_calls": h.get("err_calls", 0),
             "err_rate": h.get("err_rate", 0.0),
@@ -386,13 +541,20 @@ def smart_combo(hours=24.0):
     return {"generated_at": datetime.now().isoformat(timespec="seconds"),
             "window_hours": hours, "combo_name": "free-smart",
             "pool_size": len(pool), "steps": steps,
+            "candidates": candidates[:40],
+            "include_unused": bool(include_unused),
             "note": "1 entry per model; healthy first, rate-limited last"}
 
 
 @router.get("/data")
 def api_data(hours: float = 24.0):
     hours = max(0.1, min(720.0, hours))
-    return JSONResponse(core.cached(hours))
+    payload = core.cached(hours)
+    try:
+        payload["velocity"] = _velocity()
+    except Exception:
+        payload.setdefault("velocity", [])
+    return JSONResponse(payload)
 
 
 @router.get("/health")
@@ -408,15 +570,17 @@ def api_summary(hours: float = 24.0):
     pinned = _combos_pinned(hours)
     fb = _fallback_chain(hours)
     _maybe_broadcast(h["summary"], pinned)
+    limited_models = [{"model": m["model"], "provider": m["provider"]}
+                      for m in h["models"] if m["status"] == "limited"][:30]
     return JSONResponse({"generated_at": h["generated_at"],
                          "summary": h["summary"], "pinned": pinned,
-                         "fallback": fb})
+                         "fallback": fb, "limited_models": limited_models})
 
 
 @router.get("/combo")
-def api_combo(hours: float = 24.0):
+def api_combo(hours: float = 24.0, include_unused: int = 0):
     hours = max(0.1, min(720.0, hours))
-    return JSONResponse(smart_combo(hours))
+    return JSONResponse(smart_combo(hours, bool(include_unused)))
 
 
 @router.get("/version")
@@ -424,13 +588,73 @@ def api_version():
     return {"name": "usage-monitor", "version": PLUGIN_VERSION}
 
 
-@router.post("/combo/write")
-def api_combo_write(body: dict | None = None):
-    hours = float((body or {}).get("hours", 24.0))
-    hours = max(0.1, min(720.0, hours))
-    plan = smart_combo(hours)
-    if not plan["steps"]:
-        raise HTTPException(status_code=409, detail="empty pool")
+def _velocity(mins=5.0):
+    """Top token burners in the last N minutes (OmniRoute session_tag)."""
+    since = (datetime.now(timezone.utc) - timedelta(minutes=mins)).strftime(
+        "%Y-%m-%dT%H:%M:%S.000Z")
+    c = core.ro(core.OMNI_DB)
+    if c is None or not core.has_table(c, "call_logs"):
+        return []
+    try:
+        rows = c.execute("SELECT session_tag, coalesce(model,'?') model," +
+            " count(*) n, sum(tokens_in + tokens_out) tok FROM call_logs" +
+            " WHERE timestamp >= ? AND session_tag IS NOT NULL" +
+            " AND session_tag != '' GROUP BY session_tag, model",
+            (since,)).fetchall()
+    finally:
+        try:
+            c.close()
+        except Exception:
+            pass
+    agg = {}
+    for r in rows:
+        a = agg.setdefault(r["session_tag"], {"tag": r["session_tag"],
+            "calls": 0, "tok": 0, "model": r["model"]})
+        a["calls"] += r["n"] or 0
+        a["tok"] += r["tok"] or 0
+        if (r["tok"] or 0) > 0:
+            a["model"] = r["model"]
+    out = []
+    for a in agg.values():
+        a["tpm"] = int(round(a["tok"] / mins))
+        out.append(a)
+    out.sort(key=lambda a: -a["tpm"])
+    return out[:10]
+
+
+def _combo_digest(steps):
+    h = hashlib.sha1()
+    for s in steps:
+        h.update((str(s["model"]) + "@" + str(s["providerId"]) + ";").
+                 encode("utf-8", "replace"))
+    return h.hexdigest()
+
+
+def _current_combo_digest():
+    """Digest of the stored free-smart combo, or None when absent."""
+    c = core.ro(core.OMNI_DB)
+    if c is None or not core.has_table(c, "combos"):
+        return None
+    try:
+        row = c.execute("SELECT data FROM combos WHERE name='free-smart'"
+                        ).fetchone()
+    finally:
+        try:
+            c.close()
+        except Exception:
+            pass
+    if not row:
+        return None
+    try:
+        models = json.loads(row["data"]).get("models", [])
+    except (ValueError, TypeError, AttributeError):
+        return None
+    return _combo_digest([{"model": m.get("model"),
+                           "providerId": m.get("providerId")}
+                          for m in models])
+
+
+def _write_combo(plan):
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
     data = json.dumps({
         "name": "free-smart", "strategy": "priority",
@@ -453,5 +677,35 @@ def api_combo_write(body: dict | None = None):
         rw.commit()
     finally:
         rw.close()
+    return now
+
+
+@router.post("/combo/write")
+def api_combo_write(body: dict | None = None):
+    body = body or {}
+    hours = max(0.1, min(720.0, float(body.get("hours", 24.0))))
+    plan = smart_combo(hours, bool(body.get("include_unused")))
+    if not plan["steps"]:
+        raise HTTPException(status_code=409, detail="empty pool")
+    written_at = _write_combo(plan)
     return {"ok": True, "combo": "free-smart",
-            "steps": len(plan["steps"]), "generated_at": plan["generated_at"]}
+            "steps": len(plan["steps"]), "written_at": written_at,
+            "generated_at": plan["generated_at"]}
+
+
+@router.post("/combo/auto-refresh")
+def api_combo_auto(body: dict | None = None):
+    """Recompute and rewrite free-smart ONLY when the order changed (#6)."""
+    body = body or {}
+    hours = max(0.1, min(720.0, float(body.get("hours", 24.0))))
+    plan = smart_combo(hours, bool(body.get("include_unused")))
+    if not plan["steps"]:
+        raise HTTPException(status_code=409, detail="empty pool")
+    new_d = _combo_digest(plan["steps"])
+    if _current_combo_digest() == new_d:
+        return {"ok": True, "changed": False, "steps": len(plan["steps"]),
+                "checked_at": datetime.now().isoformat(timespec="seconds")}
+    written_at = _write_combo(plan)
+    return {"ok": True, "changed": True, "steps": len(plan["steps"]),
+            "written_at": written_at,
+            "checked_at": datetime.now().isoformat(timespec="seconds")}
