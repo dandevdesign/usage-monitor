@@ -474,13 +474,15 @@ function HealthTab({ t, hours }) {
     children: [
       jsxs('div', {
         className: 'flex flex-wrap items-center gap-2',
-        children: ['limited', 'failing', 'degraded', 'healthy'].map((k) =>
-          jsx(Badge, { variant: stColor(k), children: t('st_' + k) + ': ' + (sum[k] || 0) }, k)),
-        jsx('span', { className: 'flex-1' }),
-        jsxs('label', { className: 'flex items-center gap-1.5 text-xs',
-          children: [jsx(Switch, { checked: notify, onCheckedChange: setNotifyVal }),
-            t('notifyLimited')] }),
-      ]),
+        children: [
+          ['limited', 'failing', 'degraded', 'healthy'].map((k) =>
+            jsx(Badge, { variant: stColor(k), children: t('st_' + k) + ': ' + (sum[k] || 0) }, k)),
+          jsx('span', { className: 'flex-1' }),
+          jsxs('label', { className: 'flex items-center gap-1.5 text-xs',
+            children: [jsx(Switch, { checked: notify, onCheckedChange: setNotifyVal }),
+              t('notifyLimited')] }),
+        ],
+      }),
       jsx('p', { className: 'text-xs text-(--ui-text-secondary)', children: t('healthIntro') }),
       jsxs('div', {
         className: 'flex flex-wrap items-center gap-3',
