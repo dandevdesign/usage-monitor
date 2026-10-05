@@ -3,19 +3,24 @@
 Mounted at /api/plugins/usage-monitor/. ctx.rest('/data?hours=24')
 from desktop plugin.js reaches the same routes. Read-only except
 POST /combo/write which upserts ONE combo row (free-smart).
-No external API calls, no cost.
+Telemetry is read from the local OmniRoute storage. One unauthenticated
+proxy call to OmniRoute's free-model catalog endpoint (no auth, no cost,
+5-minute cache + stale cache fallback when the catalog is unreachable).
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
+
+import httpx
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
@@ -32,7 +37,7 @@ if _DIR not in _sys.path:
 import usage_core as core
 
 router = APIRouter()
-PLUGIN_VERSION = "1.1.0"
+PLUGIN_VERSION = "1.2.0"
 
 _HEALTH_TTL = 10.0
 _health_cache: dict = {}
@@ -714,7 +719,193 @@ def api_combo_auto(body: dict | None = None):
     if _current_combo_digest() == new_d:
         return {"ok": True, "changed": False, "steps": len(plan["steps"]),
                 "checked_at": datetime.now().isoformat(timespec="seconds")}
-    written_at = _write_combo(plan)
-    return {"ok": True, "changed": True, "steps": len(plan["steps"]),
-            "written_at": written_at,
-            "checked_at": datetime.now().isoformat(timespec="seconds")}
+
+# ── free-model catalog (proxy to OmniRoute; unauthenticated, no cost) ───────
+FREE_MODEL_CACHE_FILE = _os.path.join(_DIR, "free_model_catalog.json")
+FREE_MODEL_TTL = 300.0  # 5 min
+_free_catalog: list[dict] | None = None
+_free_catalog_ts: float = 0.0
+
+
+def _catalog_cache_file_ok(path: str) -> tuple[list[dict], float]:
+    """Load a non-expired cache from disk (models, fetched_epoch) or
+    raise FileNotFoundError when none exists / is expired."""
+    if not _os.path.exists(path):
+        raise FileNotFoundError("no catalog cache")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            payload = json.load(fh)
+        models = payload.get("models")
+        fetched_ts = float(payload.get("fetched_at_ts", 0))
+        ttl = float(payload.get("ttl_sec", FREE_MODEL_TTL))
+        if not isinstance(models, list):
+            raise ValueError("invalid cache")
+        if time.time() - fetched_ts >= ttl:
+            raise FileNotFoundError("cache expired")
+        return models, fetched_ts
+    except (ValueError, TypeError, json.JSONDecodeError):
+        raise FileNotFoundError("cache corrupt")
+
+
+def _write_catalog_cache(models: list[dict]) -> None:
+    """Atomically write a catalog cache (write tmp, rename)."""
+    payload = {"models": models,
+               "fetched_at_ts": time.time(),
+               "ttl_sec": int(FREE_MODEL_TTL)}
+    tmp = FREE_MODEL_CACHE_FILE + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False)
+        _os.replace(tmp, FREE_MODEL_CACHE_FILE)
+    except Exception:
+        try:
+            _os.remove(tmp)
+        except Exception:
+            pass
+
+def _fetch_free_catalog(refresh: bool = False) -> tuple[list[dict], dict]:
+    """Return (models, meta) from OmniRoute's free-model catalog.
+
+    meta: fetched_at | stale_since | ttl_sec | error (unauthenticated,
+    no cost). Prefers the local OmniRoute gateway; falls back to the
+    remote endpoint. When the catalog is unreachable a 5-min stale cache
+    is returned with stale_since set, so the UI never goes blank.
+    """
+    global _free_catalog, _free_catalog_ts
+    now = time.time()
+    if (not refresh and _free_catalog is not None
+            and (now - _free_catalog_ts) < FREE_MODEL_TTL):
+        return _free_catalog, {"fetched_at": datetime.fromtimestamp(
+            _free_catalog_ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            "stale_since": None, "ttl_sec": int(FREE_MODEL_TTL)}
+    try:
+        models, fetched_ts = _catalog_cache_file_ok(FREE_MODEL_CACHE_FILE)
+        _free_catalog, _free_catalog_ts = models, fetched_ts
+        return models, {"fetched_at": datetime.fromtimestamp(
+            fetched_ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            "stale_since": None, "ttl_sec": int(FREE_MODEL_TTL)}
+    except FileNotFoundError:
+        _free_catalog, _free_catalog_ts = None, 0.0
+    error = None
+    urls: list[str] = []
+    gw = os.environ.get("OMNI_URL") or "http://127.0.0.1:20128"
+    urls.append(f"{gw}/api/free-models")
+    if gw.startswith("http://127.0.0.1") or gw.startswith("http://localhost"):
+        urls.append("https://api.omniroute.ai/api/free-models")
+    for url in urls:
+        try:
+            r = httpx.get(url, timeout=25)
+            r.raise_for_status()
+            data = r.json()
+            if isinstance(data, list):
+                models = data
+            elif isinstance(data, dict) and "models" in data:
+                models = data["models"]
+            else:
+                error = "unexpected payload shape"
+                continue
+            _write_catalog_cache(models)
+            _free_catalog, _free_catalog_ts = models, now
+            return models, {"fetched_at": datetime.fromtimestamp(
+                now, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                "stale_since": None, "ttl_sec": int(FREE_MODEL_TTL)}
+        except Exception as e:  # noqa: BLE001
+            error = error or str(e)
+            models = []
+    _free_catalog, _free_catalog_ts = [], now
+    return [], {"fetched_at": datetime.fromtimestamp(
+        now, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+        "stale_since": now, "ttl_sec": int(FREE_MODEL_TTL), "error": error}
+
+
+def _health_status_from(last_error: str, recent_errors: int,
+                        test_status: str) -> str:
+    if test_status != "active":
+        return "offline"
+    if recent_errors > 30:
+        return "warn"
+    if last_error and ("limit" in last_error.lower()
+                       or "expired" in last_error.lower()
+                       or "401" in last_error
+                       or "incorrect" in last_error.lower()):
+        return "warn"
+    return "healthy"
+
+
+def _provider_health(hours: float = 1.0) -> dict[str, dict]:
+    """Provider health derived from the local OmniRoute storage only."""
+    o = _omni()
+    if not core.has_table(o, "provider_connections"):
+        return {}
+    since = core.since_iso(hours)
+    err_rows = o.execute(
+        "SELECT coalesce(provider,'?') p, count(*) n FROM call_logs"
+        " WHERE timestamp >= ? AND status >= 400 GROUP BY p", (since,)).fetchall()
+    err_by_prov = {str(r[0]): int(r[1]) for r in err_rows}
+    conn_rows = o.execute(
+        "SELECT provider, name, email, test_status, last_error, synced_models_at"
+        " FROM provider_connections").fetchall()
+    out: dict[str, dict] = {}
+    for r in conn_rows:
+        prov = str(r[0] or "")
+        disp = str(r[1] or prov)
+        out[prov] = {
+            "provider": prov,
+            "displayName": disp,
+            "healthy": False,
+            "status": str(r[3] or "inactive"),
+            "recent_errors": err_by_prov.get(prov, 0),
+            "last_error": str(r[4] or "")[:160],
+            "last_synced": (str(r[5])[:19].replace("T", " ")
+                            if str(r[5]) else "-"),
+        }
+    for prov, row in out.items():
+        row["health"] = _health_status_from(row["last_error"],
+                                            row["recent_errors"],
+                                            row["status"])
+        row["healthy"] = row["health"] == "healthy"
+    return out
+
+
+@router.get("/api/v1/free-models")
+def api_free_models(refresh: bool = False,
+                    provider: str | None = None,
+                    hours: float = 24.0) -> dict[str, Any]:
+    """Free-model catalog from OmniRoute (modelId, provider, freeType,
+    monthlyTokens, creditTokens, tos). Supports ?refresh=1 and
+    ?provider=<id> filtering."""
+    models, meta = _fetch_free_catalog(refresh)
+    if provider:
+        models = [m for m in models
+                  if (m.get("provider") or "").lower() == provider.lower()]
+    return {"models": models, "meta": meta}
+
+
+@router.get("/api/v1/free-models/providers")
+def api_free_models_providers(hours: float = 1.0) -> dict[str, Any]:
+    """Per-provider summary: live health from telemetry + free-model
+    counts from the catalog."""
+    models, _ = _fetch_free_catalog()
+    health = _provider_health(hours)
+    counts: dict[str, int] = {}
+    for m in models:
+        p = (m.get("provider") or "").lower()
+        counts[p] = counts.get(p, 0) + 1
+    out = []
+    for prov, row in health.items():
+        row["models_in_catalog"] = counts.get(prov.lower(), 0)
+        row["free_models"] = counts.get(prov.lower(), 0)
+        out.append(row)
+    out.sort(key=lambda r: (-int(r["models_in_catalog"]), r["provider"]))
+    return {"providers": out,
+            "total_providers": len(out),
+            "healthy": sum(1 for p in out if p["healthy"])}
+
+
+@router.get("/api/v1/free-models/provider/{provider}")
+def api_free_model_provider(provider: str) -> dict[str, Any]:
+    """All free models offered by a single provider."""
+    models, meta = _fetch_free_catalog()
+    models = [m for m in models
+              if (m.get("provider") or "").lower() == provider.lower()]
+    return {"provider": provider, "models": models, "meta": meta}

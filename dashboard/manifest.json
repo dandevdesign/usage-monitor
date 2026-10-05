@@ -3,7 +3,7 @@
   "label": "Usage",
   "description": "Hermes model/token usage, rate-limit health and smart free-model combo.",
   "icon": "Activity",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "api": "plugin_api.py",
   "entry": "index.js",
   "hidden": true

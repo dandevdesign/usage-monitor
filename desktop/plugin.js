@@ -37,7 +37,8 @@ const fmtN = (n) => {
   return String(Math.round(n))
 }
 const stColor = (s) =>
-  s === 'healthy' ? 'success' : s === 'degraded' ? 'warn'
+  s === 'healthy' ? 'success' : s === 'warn' ? 'warn'
+  : s === 'degraded' ? 'warn'
   : s === 'limited' || s === 'failing' ? 'destructive' : 'muted'
 const pct1 = (p) => (p == null ? '-' : (p >= 0 ? '+' : '') + p + '%')
 
@@ -60,6 +61,18 @@ const useCombo = (hours, incl) => useQuery({
   queryKey: [ID, 'combo', hours, incl ? 'u' : 'c'],
   queryFn: () => rest('/combo?hours=' + hours + (incl ? '&include_unused=1' : '')),
   refetchInterval: 15000,
+})
+
+const useFreeModels = (interval = 60) => useQuery({
+  queryKey: [ID, 'freeModels', interval],
+  queryFn: () => rest('/api/v1/free-models'),
+  refetchInterval: interval > 0 ? interval * 1000 : false,
+})
+
+const useFreeProviderStatus = () => useQuery({
+  queryKey: [ID, 'freeProviders'],
+  queryFn: () => rest('/api/v1/free-models/providers'),
+  refetchInterval: 60000,
 })
 
 // ── i18n: ship own strings; resolved against the app locale ──────────────
@@ -122,6 +135,27 @@ const EN = {
   // errors
   errUsage: 'usage unavailable', errHealth: 'health unavailable',
   errCombo: 'combo unavailable',
+  // free models
+  tabFreeModels: 'Free models',
+  freeModelsTitle: 'Free models',
+  freeIntro: 'free-model catalog across providers — freeType, quotas, TOS',
+  lastUpdated: 'last updated',
+  refreshNow: 'Refresh now',
+  staleCache: 'cache stale',
+  healthyProviders: 'healthy',
+  unhealthyProviders: 'unhealthy',
+  freeAutoRefresh: 'Auto-refresh',
+  freeEvery: 'every',
+  free30: '30s', free60: '1m', free3m: '3m', free5m: '5m', freeNone: 'never',
+  allProviders: 'All providers',
+  hDisplayName: 'Display',
+  hFreeType: 'Free type', hMonthly: 'Monthly quota', hCredits: 'Credits', hTOS: 'TOS', hFreeStatus: 'Health',
+  ftUncapped: 'uncapped', ftDaily: 'daily', ftMonthly: 'monthly', ftCredit: 'credits', ftOneTime: 'one-time', ftKeyless: 'keyless', ftZero: '0',
+  tosCaution: 'TOS: use carefully', tosAvoid: 'TOS: avoid',
+  st_warn: 'warn', st_offline: 'offline',
+  freeModelChipTip: 'Free models',
+  freeModelsCountSub: 'free models available',
+  freeProvidersTitle: 'Providers',
   // v1.1 — filters, report, raw errors, cadence, candidates, auto, velocity
   filterSearch: 'Filter models…',
   onlyFree: 'only free', onlyBroken: 'only problems',
@@ -227,6 +261,27 @@ const BG = {
   notifyLimited: 'Нотификация при нов limited модел',
   notifyTitle: 'Моделът е rate-limited',
   notifyBody: (m, p) => m + ' @ ' + p + ' е ограничен точно сега',
+  // free models
+  tabFreeModels: 'Безплатни модели',
+  freeModelsTitle: 'Безплатни модели',
+  freeIntro: 'каталог на безплатни модели по доставчици — freeType, квоти, TOS',
+  lastUpdated: 'последно обновено',
+  refreshNow: 'Обнови сега',
+  staleCache: 'касето е остаряло',
+  healthyProviders: 'здрав',
+  unhealthyProviders: 'нездрав',
+  freeAutoRefresh: 'Авто-обновяване',
+  freeEvery: 'на всеки',
+  free30: '30с', free60: '1мин', free3m: '3мин', free5m: '5мин', freeNone: 'никога',
+  allProviders: 'Всички доставчици',
+  hDisplayName: 'Изображение',
+  hFreeType: 'Free тип', hMonthly: 'Месечна квота', hCredits: 'Кредити', hTOS: 'TOS', hFreeStatus: 'Здраве',
+  ftUncapped: 'безкраен', ftDaily: 'дневно', ftMonthly: 'месечно', ftCredit: 'кредити', ftOneTime: 'първоначален', ftKeyless: 'без ключ', ftZero: '0',
+  tosCaution: 'TOS: ползвай внимателно', tosAvoid: 'TOS: избягвай',
+  st_warn: 'предупр.', st_offline: 'неактивен',
+  freeModelChipTip: 'Безплатни модели',
+  freeModelsCountSub: 'безплатни модели',
+  freeProvidersTitle: 'Доставчици',
 }
 
 // ── shared building blocks ───────────────────────────────────────────────
@@ -792,6 +847,186 @@ function UsageTab({ t, hours }) {
   })
 }
 
+function FreeModelsTab({ t }) {
+  const [filter, setFilter] = useState('')
+  const [provider, setProvider] = useState('all')
+  const [details, setDetails] = useState(null)
+  const [msg, setMsg] = useState('')
+  const [auto, setAuto] = useState(() =>
+    !!(pluginCtx && pluginCtx.storage.get('freeAutoRefresh', false)))
+  const [interval, setInterval] = useState(() =>
+    String(pluginCtx ? pluginCtx.storage.get('freeInterval', '60') : '60'))
+
+  const q = useFreeModels(Number(interval))
+  const ps = useFreeProviderStatus()
+  const cats = q.data?.models || []
+  const provs = ps.data?.providers || []
+  const meta = q.data?.meta || {}
+  const stale = meta.stale_since != null
+  const totals = {
+    total: cats.length,
+    providers: ps.data?.total_providers || provs.length,
+    healthy: ps.data?.healthy ?? provs.filter((p) => p.healthy).length,
+  }
+  const needle = filter.trim().toLowerCase()
+  const filtered = cats.filter((m) => {
+    const p = (m.provider || '').toLowerCase()
+    if (provider !== 'all' && p !== provider) return false
+    if (needle && (m.modelId + ' ' + (m.provider || '') + ' ' + (m.displayName || '')).toLowerCase().indexOf(needle) < 0) return false
+    return true
+  })
+  const hmap = {}
+  provs.forEach((p) => { hmap[p.provider] = p })
+
+  const refresh = async () => {
+    try {
+      await queryClient.invalidateQueries({ queryKey: [ID, 'freeModels', Number(interval)] })
+      setMsg(t('refreshNow') + '…')
+      setTimeout(() => setMsg(''), 1500)
+    } catch (e) {
+      setMsg(t('autoFail', String((e && e.message) || e)))
+    }
+  }
+
+  const healthBadge = (h) =>
+    h
+      ? jsx(Badge, { variant: stColor(h.health), children: t('st_' + h.health) })
+      : jsx('span', { className: 'text-(--ui-text-secondary)', children: '-' })
+
+  const modelRow = (m) => {
+    const p = (m.provider || '').toLowerCase()
+    const h = hmap[p]
+    const ft = (m.freeType || '').toLowerCase()
+    let ftLabel
+    if (ft === 'keyless') ftLabel = t('ftKeyless')
+    else if (ft === 'one-time-initial') ftLabel = t('ftOneTime')
+    else if (ft.includes('recurring')) {
+      if (ft.includes('uncapped')) ftLabel = t('ftUncapped')
+      else if (ft.includes('daily')) ftLabel = t('ftDaily')
+      else if (ft.includes('monthly')) ftLabel = t('ftMonthly')
+      else ftLabel = t('ftCredit')
+    } else {
+      ftLabel = ft.replace(/-/g, ' ')
+    }
+    const monthly = m.monthlyTokens == null
+      ? '0'
+      : m.monthlyTokens === 0
+        ? t('ftZero')
+        : (m.monthlyTokens / 1e6).toFixed(1) + 'M'
+    const credits = m.creditTokens == null
+      ? '-'
+      : fmtN(m.creditTokens)
+    let tosLabel
+    const tosV = (m.tos || '').toLowerCase()
+    if (tosV === 'caution') tosLabel = t('tosCaution')
+    else if (tosV === 'avoid') tosLabel = t('tosAvoid')
+    else tosLabel = m.tos || '-'
+    return [
+      jsx('span', { children: m.provider || '-' }),
+      jsx('span', { className: 'font-mono', children: m.modelId || '-' }),
+      jsx('span', { children: m.displayName || m.modelId }),
+      jsx('span', { children: ftLabel }),
+      jsx('span', { children: monthly }),
+      jsx('span', { children: credits }),
+      jsx(Badge, { variant: tosV === 'avoid' ? 'destructive' : tosV === 'caution' ? 'warn' : 'muted', children: tosLabel }),
+      healthBadge(h),
+    ]
+  }
+
+  const headerRow = () => jsxs('div', { className: 'flex flex-wrap items-center gap-2', children: [
+    jsx(SearchField, { placeholder: t('filterSearch'), value: filter, onChange: setFilter }),
+    jsxs('label', { className: 'flex items-center gap-1.5 text-xs', children: [
+      jsx('select', { className: 'rounded bg-(--ui-bg-tertiary) px-2 py-1 text-xs', value: provider, onChange: (e) => setProvider(e.target.value) }, [
+        jsx('option', { value: 'all', children: t('allProviders') }),
+        ...provs.map((p) => jsx('option', { value: p.provider, children: p.displayName || p.provider }, p.provider)),
+      ]),
+    ] }),
+    jsx('span', { className: 'flex-1' }),
+    jsxs('label', { className: 'flex items-center gap-1.5 text-xs', children: [
+      jsx(Switch, { checked: auto, onCheckedChange: (v) => {
+        const b = v === true
+        setAuto(b)
+        if (pluginCtx) pluginCtx.storage.set('freeAutoRefresh', b)
+      } }),
+      t('freeAutoRefresh'),
+    ] }),
+    auto ? jsxs('span', { className: 'flex items-center gap-1.5 text-xs', children: [
+      t('freeEvery'),
+      jsx(SegmentedControl, { value: interval, onChange: (v) => {
+        setInterval(v)
+        if (pluginCtx) pluginCtx.storage.set('freeInterval', v)
+      }, options: [
+        { id: '30', label: t('free30') },
+        { id: '60', label: t('free60') },
+        { id: '180', label: t('free3m') },
+        { id: '300', label: t('free5m') },
+        { id: '0', label: t('freeNone') },
+      ] }),
+    ] }) : null,
+    msg ? jsx('span', { className: 'text-xs text-(--ui-text-secondary)', children: msg }) : null,
+    jsx('span', { className: 'text-xs text-(--ui-text-secondary)', children: t('lastUpdated') + ': ' + (meta.fetched_at || '-') }),
+    jsx('button', {
+      type: 'button',
+      className: 'inline-flex h-6 items-center gap-1 rounded px-2 text-xs transition-colors',
+      onClick: refresh,
+      children: t('refreshNow'),
+    }),
+  ] })
+  if (q.isLoading || ps.isLoading) return jsx(Skeleton, { className: 'w-full', style: { height: '160px' } })
+  if (q.isError || ps.isError) return jsx(ErrorState, { title: t('freeModelsTitle'), description: String((q.error && q.error.message) || q.error) })
+
+  return jsxs('div', { className: 'flex h-full flex-col gap-2 p-3 text-sm overflow-y-auto', children: [
+    // summary cards
+    jsx('div', { className: 'grid gap-2', style: { gridTemplateColumns: 'repeat(auto-fit, minmax(120px, 1fr))' }, children: [
+      jsxs('div', { className: 'rounded-md border border-(--ui-stroke-secondary) p-2.5', children: [
+        jsx('div', { className: 'text-xs uppercase tracking-wide text-(--ui-text-tertiary)', children: t('freeModelsTitle') }),
+        jsx('div', { className: 'mt-1 text-xl font-semibold', children: String(totals.total) }),
+        jsx('div', { className: 'text-xs text-(--ui-text-secondary)', children: t('freeModelsCountSub') }),
+      ] }),
+      jsxs('div', { className: 'rounded-md border border-(--ui-stroke-secondary) p-2.5', children: [
+        jsx('div', { className: 'text-xs uppercase tracking-wide text-(--ui-text-tertiary)', children: t('freeProvidersTitle') }),
+        jsx('div', { className: 'mt-1 text-xl font-semibold', children: String(totals.providers) }),
+        jsx('div', { className: 'text-xs text-(--ui-text-secondary)', children: t('healthyProviders') + ': ' + totals.healthy }),
+      ] }),
+      stale ? jsxs('div', { className: 'rounded-md border border-(--ui-stroke-secondary) p-2.5', children: [
+        jsx('div', { className: 'text-xs uppercase tracking-wide text-(--ui-text-tertiary)', children: t('staleCache') }),
+        jsx('div', { className: 'mt-1 text-xl font-semibold', style: { color: 'var(--color-amber-600)' }, children: '?' }),
+        jsx('div', { className: 'text-xs text-(--ui-text-secondary)', children: 'since ' + meta.stale_since }),
+      ] }) : null,
+    ] }),
+    headerRow(),
+    jsx(Sec, { title: t('freeModelsTitle'), children: jsx(Tbl, {
+      cols: [t('hProvider'), t('hModel'), t('hDisplayName'), t('hFreeType'), t('hMonthly'), t('hCredits'), t('hTOS'), t('hFreeStatus')],
+      rows: filtered.map(modelRow),
+      onRow: (i) => setDetails(filtered[i]),
+    }) }),
+    jsx(Dialog, {
+      open: !!details,
+      onOpenChange: (o) => { if (!o) setDetails(null) },
+      children: details ? jsxs(DialogContent, { children: [
+        jsx(DialogHeader, { children: jsx(DialogTitle, { children: details.modelId + ' @ ' + details.provider }) }),
+        jsx(DialogDescription, { children: details.displayName || '' }),
+        jsx('div', { className: 'mt-2 max-h-64 overflow-y-auto', children: [
+          ['provider', details.provider],
+          ['modelId', details.modelId],
+          ['displayName', details.displayName],
+          ['freeType', details.freeType],
+          ['monthlyTokens', (details.monthlyTokens || 0) === 0 ? '0' : details.monthlyTokens ? (details.monthlyTokens / 1e6).toFixed(1) + 'M' : '-'],
+          ['creditTokens', details.creditTokens ? fmtN(details.creditTokens) : '-'],
+          ['poolKey', details.poolKey || '-'],
+          ['tos', details.tos || '-'],
+        ].map(([k, v], i) => jsxs('div', { className: 'flex items-center gap-2 text-xs', children: [
+          jsx('span', { className: 'text-(--ui-text-tertiary)', children: k }),
+          jsx('span', { className: 'font-mono', children: String(v) }),
+        ] }, i)) }),
+        jsxs('div', { className: 'mt-3 flex justify-end gap-2', children: [
+          jsx(Button, { onClick: () => setDetails(null), children: t('dialogClose') }),
+        ] }),
+      ] }) : null,
+    }),
+  ] })
+}
+
 function UsagePage() {
   const t = usePluginI18n(ID)
   const [hours, setHours] = useState('24')
@@ -807,12 +1042,14 @@ function UsagePage() {
               { id: 'usage', label: t('tabUsage') },
               { id: 'health', label: t('tabHealth') },
               { id: 'combo', label: t('tabCombo') },
+              { id: 'free', label: t('tabFreeModels') },
             ] }),
           jsx('span', { className: 'flex-1' }),
           jsx(SegmentedControl, { value: hours, onChange: setHours, options: WINDOWS }),
         ] }),
       tab === 'usage' ? jsx(UsageTab, { t, hours })
         : tab === 'health' ? jsx(HealthTab, { t, hours })
+        : tab === 'free' ? jsx(FreeModelsTab, { t })
         : jsx(ComboTab, { t, hours }),
     ],
   })
@@ -866,6 +1103,26 @@ function UsageChip() {
   })
 }
 
+function FreeModelsChip() {
+  const t = usePluginI18n(ID)
+  const q = useFreeModels()
+  const count = q.data?.models?.length || '?'
+  const stale = q.data?.meta?.stale_since != null
+  const cls = stale ? 'text-destructive' : 'text-(--ui-text-tertiary)'
+  const tip = stale
+    ? t('freeModelChipTip') + ': ' + count + ' (' + t('staleCache') + ')'
+    : t('freeModelChipTip') + ': ' + count + ' free models'
+  return jsx(Tip, {
+    label: tip,
+    children: jsx('button', {
+      type: 'button',
+      className: 'inline-flex h-full items-center gap-1 px-1.5 text-xs transition-colors ' + cls,
+      onClick: () => { hapticSafe(); host.navigate(PATH) },
+      children: 'free ' + count,
+    }),
+  })
+}
+
 function hapticSafe() {
   try { haptic('tap') } catch (e) { /* older SDK */ }
 }
@@ -887,8 +1144,12 @@ export default {
         render: () => jsx(UsagePage, {}) },
       { id: 'nav', area: SIDEBAR_NAV_AREA,
         data: { path: PATH, label: 'Usage', codicon: 'pulse' } },
+      { id: 'nav-free', area: SIDEBAR_NAV_AREA,
+        data: { path: PATH, label: 'Free models', codicon: 'star' } },
       { id: 'chip', area: STATUSBAR_AREAS.right, order: 130,
         render: () => jsx(UsageChip, {}) },
+      { id: 'chip-free', area: STATUSBAR_AREAS.right, order: 131,
+        render: () => jsx(FreeModelsChip, {}) },
       { id: 'open', area: PALETTE_AREA,
         data: { id: 'usage.open', label: 'Open Usage Monitor',
           keywords: ['usage', 'models', 'health', 'combo', 'rate', 'limit'],
