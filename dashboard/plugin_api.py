@@ -20,6 +20,15 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
 
+# The host imports this file by path (importlib), NOT with the dashboard dir
+# on sys.path — bootstrap our sibling module before importing it, otherwise
+# every route fails with "No module named 'usage_core'" (404 on every call).
+import os as _os
+import sys as _sys
+_DIR = _os.path.dirname(_os.path.abspath(__file__))
+if _DIR not in _sys.path:
+    _sys.path.insert(0, _DIR)
+
 import usage_core as core
 
 router = APIRouter()
